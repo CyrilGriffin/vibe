@@ -1,0 +1,95 @@
+name: Build vibe-server for Ubuntu 22.04
+
+on:
+  workflow_dispatch:
+    inputs:
+      server_tag:
+        description: 'Server tag matching your installed Vibe (e.g. server-v0.6.10 for Vibe 3.2.2)'
+        required: true
+        default: 'server-v0.6.10'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+        working-directory: server
+
+    steps:
+      - name: Check out matching upstream server source
+        uses: actions/checkout@v4
+        with:
+          repository: thewh1teagle/vibe
+          ref: ${{ inputs.server_tag }}
+          persist-credentials: false
+
+      - name: Install native build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential binutils cmake git curl pkg-config \
+            clang libclang-dev libssl-dev ca-certificates gnupg
+
+      - name: Install Vulkan SDK for Ubuntu 22.04 (on runner only)
+        run: |
+          sudo install -d -m 0755 /etc/apt/keyrings
+          curl -fsSL https://packages.lunarg.com/lunarg-signing-key-pub.asc \
+            | sudo tee /etc/apt/keyrings/lunarg.asc >/dev/null
+          echo 'deb [signed-by=/etc/apt/keyrings/lunarg.asc] https://packages.lunarg.com/vulkan/1.4.313 jammy main' \
+            | sudo tee /etc/apt/sources.list.d/lunarg-vulkan.list
+          sudo apt-get update
+          sudo apt-get install -y vulkan-sdk
+          command -v glslc
+          glslc --version
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up upstream Chore build tool
+        uses: getchore/setup-chore@v1
+        with:
+          version: v1.6.0
+
+      - name: Build GGML locally on Ubuntu 22.04
+        run: |
+          chore build-libs
+          mkdir -p libs/lib
+          cp -a ggml-build/pkg/lib/. libs/lib/
+          ls -lh libs/lib/
+
+      - name: Build vibe-server using local GGML libraries
+        env:
+          SERVER_TAG: ${{ inputs.server_tag }}
+        run: |
+          export VIBE_SERVER_VERSION="${SERVER_TAG#server-}"
+          cargo build --locked --release -p vibe-server
+
+      - name: Check binary and glibc requirements
+        run: |
+          file target/release/vibe-server
+          target/release/vibe-server --version
+          ldd target/release/vibe-server
+          if ldd target/release/vibe-server | grep -q 'not found'; then
+            echo 'Missing shared-library dependencies' >&2
+            exit 1
+          fi
+          max_glibc=$(readelf --version-info target/release/vibe-server \
+            | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -Vu | tail -n 1)
+          echo "Highest required glibc symbol: $max_glibc"
+          if [ "$(printf '%s\n' 'GLIBC_2.35' "$max_glibc" | sort -V | tail -n 1)" != 'GLIBC_2.35' ]; then
+            echo 'Binary requires glibc newer than Ubuntu 22.04 provides' >&2
+            exit 1
+          fi
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: vibe-server-ubuntu2204
+          path: server/target/release/vibe-server
+          if-no-files-found: error
